@@ -28,24 +28,22 @@ jobs:
         id: find-files
         run: |
           # Find all APK and IPA files in the repository
-          APK_FILES=$(find . -type f -name "*.apk" | tr '\n' ' ')
-          IPA_FILES=$(find . -type f -name "*.ipa" | tr '\n' ' ')
+          # Store them as newline-separated strings
+          echo "apk_files<<EOF" >> $GITHUB_OUTPUT
+          find . -type f -name "*.apk" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
           
-          # Store the files as output variables
-          echo "apk_files=$APK_FILES" >> $GITHUB_OUTPUT
-          echo "ipa_files=$IPA_FILES" >> $GITHUB_OUTPUT
+          echo "ipa_files<<EOF" >> $GITHUB_OUTPUT
+          find . -type f -name "*.ipa" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
           
-          # Check if any files were found
-          if [ -z "$APK_FILES" ] && [ -z "$IPA_FILES" ]; then
-            echo "No APK or IPA files found in the repository."
-            exit 0
-          else
-            echo "Found APK files: $APK_FILES"
-            echo "Found IPA files: $IPA_FILES"
-          fi
+          # Print found files for debugging
+          echo "Found APK files:"
+          find . -type f -name "*.apk"
+          echo "Found IPA files:"
+          find . -type f -name "*.ipa"
 
       - name: Scan with MobSF and save reports
-        if: ${{ steps.find-files.outputs.apk_files != '' || steps.find-files.outputs.ipa_files != '' }}
         env:
           MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
           MOBSF_BASE_URL: ${{ secrets.MOBSF_BASE_URL }}
@@ -55,60 +53,92 @@ jobs:
           
           # Function to scan a file with MobSF
           scan_file() {
-            FILE_PATH=$1
+            FILE_PATH="$1"
+            FILE_TYPE="$2"
             FILE_NAME=$(basename "$FILE_PATH")
+            REPORT_BASE_NAME=$(echo "$FILE_NAME" | sed 's/\.[^.]*$//')
             
-            echo "Scanning $FILE_NAME..."
+            echo "Scanning $FILE_NAME (type: $FILE_TYPE)..."
+            echo "File path: $FILE_PATH"
             
-            # Upload file to MobSF
-            UPLOAD_RESPONSE=$(curl -s -F "file=@$FILE_PATH" "$MOBSF_BASE_URL/api/v1/upload" -H "Authorization: $MOBSF_API_KEY")
-            HASH=$(echo $UPLOAD_RESPONSE | python -c "import sys, json; print(json.load(sys.stdin).get('hash', ''))")
+            # Upload file to MobSF with proper error handling
+            echo "Uploading file to MobSF..."
+            UPLOAD_RESPONSE=$(curl -v -F "file=@\"$FILE_PATH\"" "$MOBSF_BASE_URL/api/v1/upload" -H "Authorization: $MOBSF_API_KEY")
+            echo "Upload response: $UPLOAD_RESPONSE"
+            
+            HASH=$(echo $UPLOAD_RESPONSE | python3 -c "import sys, json; print(json.load(sys.stdin).get('hash', ''))" 2>/dev/null)
             
             if [ -z "$HASH" ]; then
-              echo "Failed to upload $FILE_NAME"
-              return
+              echo "Failed to upload $FILE_NAME or extract hash"
+              echo "Full response: $UPLOAD_RESPONSE"
+              return 1
             fi
             
-            # Start scan
-            curl -s -X POST --url "$MOBSF_BASE_URL/api/v1/scan" \
+            echo "Successfully uploaded file, got hash: $HASH"
+            
+            # Start scan with proper error handling
+            echo "Starting scan..."
+            SCAN_RESPONSE=$(curl -v -X POST --url "$MOBSF_BASE_URL/api/v1/scan" \
               -H "Authorization: $MOBSF_API_KEY" \
               -H "Content-Type: application/x-www-form-urlencoded" \
-              --data-urlencode "scan_type=apk" \
+              --data-urlencode "scan_type=$FILE_TYPE" \
               --data-urlencode "hash=$HASH" \
-              --data-urlencode "re_scan=0"
+              --data-urlencode "re_scan=0")
+            
+            echo "Scan response: $SCAN_RESPONSE"
             
             # Generate PDF report
-            curl -s -X POST --url "$MOBSF_BASE_URL/api/v1/download_pdf" \
+            echo "Generating PDF report..."
+            curl -v -X POST --url "$MOBSF_BASE_URL/api/v1/download_pdf" \
               -H "Authorization: $MOBSF_API_KEY" \
               -H "Content-Type: application/x-www-form-urlencoded" \
               --data-urlencode "hash=$HASH" \
-              -o "mobsf-reports/${FILE_NAME%.apk}.pdf"
+              -o "mobsf-reports/${REPORT_BASE_NAME}.pdf"
             
             # Generate JSON report
-            curl -s -X POST --url "$MOBSF_BASE_URL/api/v1/report_json" \
+            echo "Generating JSON report..."
+            curl -v -X POST --url "$MOBSF_BASE_URL/api/v1/report_json" \
               -H "Authorization: $MOBSF_API_KEY" \
               -H "Content-Type: application/x-www-form-urlencoded" \
               --data-urlencode "hash=$HASH" \
-              -o "mobsf-reports/${FILE_NAME%.apk}.json"
+              -o "mobsf-reports/${REPORT_BASE_NAME}.json"
               
             echo "Scan completed for $FILE_NAME"
           }
           
           # Process APK files
-          for file in ${{ steps.find-files.outputs.apk_files }}; do
-            scan_file "$file"
-          done
+          if [ -n "${{ steps.find-files.outputs.apk_files }}" ]; then
+            echo "Processing APK files..."
+            while IFS= read -r file; do
+              if [ -n "$file" ]; then
+                scan_file "$file" "apk"
+              fi
+            done <<< "${{ steps.find-files.outputs.apk_files }}"
+          else
+            echo "No APK files to process"
+          fi
           
           # Process IPA files
-          for file in ${{ steps.find-files.outputs.ipa_files }}; do
-            # Update scan_type to ipa for iOS apps
-            scan_file "$file" "ipa"
-          done
+          if [ -n "${{ steps.find-files.outputs.ipa_files }}" ]; then
+            echo "Processing IPA files..."
+            while IFS= read -r file; do
+              if [ -n "$file" ]; then
+                scan_file "$file" "ipa"
+              fi
+            done <<< "${{ steps.find-files.outputs.ipa_files }}"
+          else
+            echo "No IPA files to process"
+          fi
+
+      - name: Check for reports
+        run: |
+          echo "Generated reports:"
+          ls -la mobsf-reports/ || echo "No reports directory found"
 
       - name: Upload scan reports as artifacts
-        if: ${{ steps.find-files.outputs.apk_files != '' || steps.find-files.outputs.ipa_files != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: mobsf-scan-reports
           path: mobsf-reports/
           retention-days: 14
+        if: always()
