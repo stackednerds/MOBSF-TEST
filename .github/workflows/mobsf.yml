@@ -107,7 +107,7 @@ jobs:
 
       - name: Upload scan reports as artifacts
         if: ${{ steps.find-files.outputs.apk_files != '' || steps.find-files.outputs.ipa_files != '' }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: mobsf-scan-reports
           path: mobsf-reports/
