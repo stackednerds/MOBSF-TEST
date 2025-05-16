@@ -1,0 +1,114 @@
+name: MobSF Security Scan
+
+on:
+  # Trigger on push to main branch
+  push:
+    branches: [ main ]
+  # Allow manual triggering
+  workflow_dispatch:
+
+jobs:
+  mobsf-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Find mobile app files
+        id: find-files
+        run: |
+          # Find all APK and IPA files in the repository
+          APK_FILES=$(find . -type f -name "*.apk" | tr '\n' ' ')
+          IPA_FILES=$(find . -type f -name "*.ipa" | tr '\n' ' ')
+          
+          # Store the files as output variables
+          echo "apk_files=$APK_FILES" >> $GITHUB_OUTPUT
+          echo "ipa_files=$IPA_FILES" >> $GITHUB_OUTPUT
+          
+          # Check if any files were found
+          if [ -z "$APK_FILES" ] && [ -z "$IPA_FILES" ]; then
+            echo "No APK or IPA files found in the repository."
+            exit 0
+          else
+            echo "Found APK files: $APK_FILES"
+            echo "Found IPA files: $IPA_FILES"
+          fi
+
+      - name: Scan with MobSF and save reports
+        if: ${{ steps.find-files.outputs.apk_files != '' || steps.find-files.outputs.ipa_files != '' }}
+        env:
+          MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
+          MOBSF_BASE_URL: ${{ secrets.MOBSF_BASE_URL }}
+        run: |
+          # Create a directory for reports
+          mkdir -p mobsf-reports
+          
+          # Function to scan a file with MobSF
+          scan_file() {
+            FILE_PATH=$1
+            FILE_NAME=$(basename "$FILE_PATH")
+            
+            echo "Scanning $FILE_NAME..."
+            
+            # Upload file to MobSF
+            UPLOAD_RESPONSE=$(curl -s -F "file=@$FILE_PATH" "$MOBSF_BASE_URL/api/v1/upload" -H "Authorization: $MOBSF_API_KEY")
+            HASH=$(echo $UPLOAD_RESPONSE | python -c "import sys, json; print(json.load(sys.stdin).get('hash', ''))")
+            
+            if [ -z "$HASH" ]; then
+              echo "Failed to upload $FILE_NAME"
+              return
+            fi
+            
+            # Start scan
+            curl -s -X POST --url "$MOBSF_BASE_URL/api/v1/scan" \
+              -H "Authorization: $MOBSF_API_KEY" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "scan_type=apk" \
+              --data-urlencode "hash=$HASH" \
+              --data-urlencode "re_scan=0"
+            
+            # Generate PDF report
+            curl -s -X POST --url "$MOBSF_BASE_URL/api/v1/download_pdf" \
+              -H "Authorization: $MOBSF_API_KEY" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "hash=$HASH" \
+              -o "mobsf-reports/${FILE_NAME%.apk}.pdf"
+            
+            # Generate JSON report
+            curl -s -X POST --url "$MOBSF_BASE_URL/api/v1/report_json" \
+              -H "Authorization: $MOBSF_API_KEY" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "hash=$HASH" \
+              -o "mobsf-reports/${FILE_NAME%.apk}.json"
+              
+            echo "Scan completed for $FILE_NAME"
+          }
+          
+          # Process APK files
+          for file in ${{ steps.find-files.outputs.apk_files }}; do
+            scan_file "$file"
+          done
+          
+          # Process IPA files
+          for file in ${{ steps.find-files.outputs.ipa_files }}; do
+            # Update scan_type to ipa for iOS apps
+            scan_file "$file" "ipa"
+          done
+
+      - name: Upload scan reports as artifacts
+        if: ${{ steps.find-files.outputs.apk_files != '' || steps.find-files.outputs.ipa_files != '' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: mobsf-scan-reports
+          path: mobsf-reports/
+          retention-days: 14
