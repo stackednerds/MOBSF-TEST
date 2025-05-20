@@ -1,8 +1,6 @@
 name: MobSF Security Scan
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
